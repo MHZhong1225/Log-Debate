@@ -18,7 +18,7 @@ from sklearn.model_selection import train_test_split
 
 # pip install torch transformers scikit-learn pandas sentence-transformers
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer # 保留用于获取max_len等信息，但不再手动编码
+from transformers import AutoTokenizer
 
 # -----------------------------
 # Configuration
