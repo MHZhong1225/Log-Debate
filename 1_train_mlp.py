@@ -9,7 +9,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 import gc  # 用于内存清理
-
+from collections import Counter
 
 # 这个新版 Dataset 的 __getitem__ 会返回 ((log_vec, ctx_vec), label)
 from dataset_log_with_context_memory_optimized import LogWithContextDatasetMemoryOptimized as LogWithContextDataset
@@ -35,26 +35,26 @@ LR          = args.lr
 MODEL_PATH  = f"model/{DATASET}/{DATASET}_best_mlp.pt"
 
 DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-TRAIN_CSV = f"./datasets/{DATASET}/log_train_0p1.csv"  # 使用10%的数据集
-VAL_CSV   = f"./datasets/{DATASET}/log_val_0p1.csv"
-TEST_CSV  = f"./datasets/{DATASET}/log_test_0p1.csv"
+TRAIN_CSV = f"./datasets/{DATASET}/log_train_1p0.csv"  # 使用10%的数据集
+VAL_CSV   = f"./datasets/{DATASET}/log_val_1p0.csv"
+TEST_CSV  = f"./datasets/{DATASET}/log_test_1p0.csv"
 
 
-# ================== 1. 定义双塔模型 ==================
+# ================== 1. 定义模型 ==================
 class TwoMLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_classes):
         super().__init__()
         # 假设 log_vec 和 ctx_vec 维度相同
         tower_input_dim = input_dim
 
-        # Log Agent 的处理塔 (微观分析)
+        # Log Agent 的处理 (微观分析)
         self.log_tower = nn.Sequential(
             nn.Linear(tower_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim // 2)
         )
         
-        # Context Agent 的处理塔 (宏观分析)
+        # Context Agent 的处理 (宏观分析)
         self.context_tower = nn.Sequential(
             nn.Linear(tower_input_dim, hidden_dim),
             nn.ReLU(),
@@ -62,7 +62,7 @@ class TwoMLP(nn.Module):
         )
         
         # 融合后的分类头
-        # 输入维度是两个塔输出维度之和
+        # 输入维度是两个模型输出维度之和
         fused_dim = (hidden_dim // 2) * 2
         self.classifier_head = nn.Linear(fused_dim, num_classes)
 
@@ -92,11 +92,11 @@ def build_dataset(csv_path, split_name):
         labels=labels,
         mode=split_name,
         ctx_agent=ctx_agent,
-        batch_encode_size=16  # 减少batch size以降低内存使用
+        batch_encode_size=32
     )
     return ds, np.array(labels)
 
-# ✨ 修改评估函数以适应双塔输入
+
 def eval_multiclass(model, loader, device):
     model.eval()
     y_true, y_pred = [], []
@@ -123,6 +123,8 @@ def eval_multiclass(model, loader, device):
 if __name__ == "__main__":
     print(f"[Memory] Building datasets...")
     train_ds, y_train = build_dataset(TRAIN_CSV, "train")
+
+
     gc.collect()  # 清理内存
     print(f"[Memory] Train dataset built, memory cleaned")
     
@@ -138,6 +140,8 @@ if __name__ == "__main__":
     NUM_CLASSES = int(max(classes) + 1)
     print(f"[Info] num_classes={NUM_CLASSES}, classes={classes}")
 
+
+
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, # ✨ 训练时建议打乱
                               num_workers=4, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
@@ -146,21 +150,38 @@ if __name__ == "__main__":
                               num_workers=4, pin_memory=True)
 
     # ================== 构建模型 ==================
-    # ✨ 手动指定维度或从 dataset 中获取
     # all-MiniLM-L6-v2 的输出维度是 384
     # ContextAgent 内部的 proj 层输出也是 hidden_dim，即 384
     INPUT_DIM = 384 
     print(f"[Info] Tower INPUT_DIM={INPUT_DIM}")
 
-    # ✨ 实例化新的双塔模型
     mlp = TwoMLP(
         input_dim=INPUT_DIM,
         hidden_dim=256,
         num_classes=NUM_CLASSES
     ).to(DEVICE)
 
-    criterion = nn.CrossEntropyLoss()
+    class_counts = Counter(y_train.tolist())
+    weights = torch.tensor(
+        [class_counts.get(i, 0) for i in range(NUM_CLASSES)],
+        dtype=torch.float
+    )
+    weights = 1.0 / torch.clamp(weights, min=1.0)
+    weights = weights / weights.sum() * NUM_CLASSES    # 归一化到均值≈1
+    weights = weights.to(DEVICE)
+
+    print("[Info] class_counts:", class_counts)
+    print("[Info] loss weights :", weights.cpu().numpy())
+
+    criterion = nn.CrossEntropyLoss(weight=weights)    # ←⭐ 用加权损失
+
+    # criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(mlp.parameters(), lr=LR)
+    steps_per_epoch = len(train_loader)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=steps_per_epoch * EPOCHS   # 完整余弦退火
+    )
 
     # ================== 训练循环 ==================
     best_f1 = 0.0
@@ -172,15 +193,16 @@ if __name__ == "__main__":
         for (log_vec, ctx_vec), y in train_loader:
             log_vec = log_vec.to(DEVICE, non_blocking=True)
             ctx_vec = ctx_vec.to(DEVICE, non_blocking=True)
-            y = y.to(DEVICE).long().squeeze(-1)
+            # y = y.to(DEVICE).long().squeeze(-1)
+            y = y.to(DEVICE).long()
 
-            # ✨ 修改点：模型接收两个输入
             logits = mlp(log_vec, ctx_vec)
             loss = criterion(logits, y)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             total_loss += loss.item()
             n_batches += 1

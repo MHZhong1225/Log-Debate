@@ -37,8 +37,8 @@ class LogWithContextDatasetMemoryOptimized(Dataset):
 
         # 标签张量（若有）
         if self.labels is not None:
-            self.labels = torch.tensor(self.labels, dtype=torch.long, device=self.device)
-
+            # self.labels = torch.tensor(self.labels, dtype=torch.long, device=self.device)
+            self.labels = torch.as_tensor(labels, dtype=torch.long, device=self.device)
     def __len__(self):
         return len(self.logs)
 
@@ -59,6 +59,7 @@ class LogWithContextDatasetMemoryOptimized(Dataset):
         if self.labels is None:
             return x
         else:
+            # return x, self.labels[idx]
             return x, self.labels[idx]
 
     def _reset_ctx_agent_window(self):

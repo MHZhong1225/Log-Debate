@@ -1,7 +1,7 @@
 # generate_debate_features.py
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import pandas as pd
 import torch
@@ -42,7 +42,7 @@ class TwoMLP(nn.Module):
         return logits
 
 # --- 配置 ---
-DATASET = "HDFS"  # BGL HDFS Tbird Hadoop 
+DATASET = "Tbird"  # BGL HDFS Tbird Hadoop 
 MLP1_MODEL_PATH = f"model/{DATASET}/{DATASET}_best_mlp.pt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CONFIDENCE_THRESHOLD = 0.85
