@@ -1,12 +1,12 @@
+import os
+import hashlib
+import gc
+
 import torch
 from torch.utils.data import Dataset
-from context_agent import ContextAgent
 from tqdm import tqdm
 
-import os, hashlib, torch
-from tqdm import tqdm
-import pandas as pd
-import gc
+from context_agent import ContextAgent
 
 CACHE_DIR = "./enc_cache"
 
@@ -21,8 +21,10 @@ class LogWithContextDatasetMemoryOptimized(Dataset):
         self.mode = mode
         self.ctx_agent = ctx_agent or ContextAgent()
         self.device = self.ctx_agent.device
+        # 数据集内部始终保存 CPU tensor，避免 DataLoader worker 与 GPU 的交互问题
+        self.storage_device = torch.device("cpu")
         self.use_context = use_context
-        
+
         if not (hasattr(self.ctx_agent, "encode_log") or hasattr(self.ctx_agent, "encoder")):
             raise RuntimeError(
                 "ContextAgent 需要提供 encode_log(text)->(tokens, emb_tensor) "
@@ -30,14 +32,21 @@ class LogWithContextDatasetMemoryOptimized(Dataset):
             )
 
         # 只预计算log vectors，不预计算context vectors
-        self.tokens_list, self.log_vecs = self._batch_encode_logs(self.logs, batch_encode_size=batch_encode_size)
+        self.tokens_list, self.log_vecs = self._batch_encode_logs(
+            self.logs,
+            batch_encode_size=batch_encode_size,
+        )
 
         # 预计算一次 ctx_vecs，并缓存到磁盘，避免在 __getitem__ 中重复构建上下文导致的极慢速度
         self.ctx_vecs = self._precompute_ctx_vecs()
 
         # 标签张量（若有）
         if self.labels is not None:
-            self.labels = torch.tensor(self.labels, dtype=torch.long, device=self.device)
+            self.labels = torch.tensor(
+                self.labels,
+                dtype=torch.long,
+                device=self.storage_device,
+            )
 
     def __len__(self):
         return len(self.logs)
@@ -45,7 +54,7 @@ class LogWithContextDatasetMemoryOptimized(Dataset):
     def __getitem__(self, idx):
         log_vec = self.log_vecs[idx]
         tokens = self.tokens_list[idx]
-        
+
         if self.use_context:
             if self.ctx_vecs is not None:
                 ctx_vec = self.ctx_vecs[idx]
@@ -97,19 +106,19 @@ class LogWithContextDatasetMemoryOptimized(Dataset):
         # 逐步构建到idx为止的context
         for i in range(idx):
             tokens_i = self.tokens_list[i]
-            log_vec_i = self.log_vecs[i]
+            log_vec_i = self.log_vecs[i].to(self.device)
             self.ctx_agent.update_window(tokens_i, log_vec_i)
-        
+
         # 获取当前索引的context vector
         if hasattr(self.ctx_agent, "get_ctx_vec"):
             try:
                 ctx_vec = self.ctx_agent.get_ctx_vec()
             except TypeError:
-                ctx_vec = self.ctx_agent.get_ctx_vec(self.log_vecs[idx])
+                ctx_vec = self.ctx_agent.get_ctx_vec(self.log_vecs[idx].to(self.device))
         else:
-            ctx_vec = torch.zeros_like(self.log_vecs[idx])
-        
-        return ctx_vec.detach().clone().to(self.device, dtype=torch.float32)
+            ctx_vec = torch.zeros_like(self.log_vecs[idx]).to(self.device)
+
+        return ctx_vec.detach().clone().to(self.storage_device, dtype=torch.float32)
 
     @torch.no_grad()
     def _batch_encode_logs(self, texts, batch_encode_size=16):
@@ -122,8 +131,9 @@ class LogWithContextDatasetMemoryOptimized(Dataset):
 
         if os.path.exists(cache_path):
             print(f"[Cache] Loading encoded logs from {cache_path}")
-            ckpt = torch.load(cache_path, map_location=self.device)
-            return ckpt["tokens_list"], ckpt["log_vecs"]
+            ckpt = torch.load(cache_path, map_location=self.storage_device)
+            log_vecs = ckpt["log_vecs"].to(self.storage_device, dtype=torch.float32)
+            return ckpt["tokens_list"], log_vecs
 
         print(f"[Cache] Encoding logs → {cache_path}")
 
@@ -131,15 +141,15 @@ class LogWithContextDatasetMemoryOptimized(Dataset):
 
         encoder = self.ctx_agent.encoder
         vec_chunks = []
-        
+
         # 使用更小的batch size并定期清理内存
         for i in tqdm(range(0, len(texts), batch_encode_size), desc="Encoding logs"):
             batch_texts = texts[i:i + batch_encode_size]
             emb = encoder.encode(batch_texts,
                                  convert_to_tensor=True,
                                  normalize_embeddings=True)
-            vec_chunks.append(emb.to(self.device, dtype=torch.float32))
-            
+            vec_chunks.append(emb.to(self.storage_device, dtype=torch.float32))
+
             # 每处理一定数量的batch后清理内存
             if i % (batch_encode_size * 10) == 0:
                 gc.collect()
@@ -148,11 +158,12 @@ class LogWithContextDatasetMemoryOptimized(Dataset):
 
         # 保存缓存
         os.makedirs(CACHE_DIR, exist_ok=True)
-        torch.save({"tokens_list": tokens_list,
-                    "log_vecs": log_vecs.cpu()},
-                   cache_path)
+        torch.save({
+            "tokens_list": tokens_list,
+            "log_vecs": log_vecs.to(self.storage_device)
+        }, cache_path)
 
-        return tokens_list, log_vecs
+        return tokens_list, log_vecs.to(self.storage_device)
 
     @torch.no_grad()
     def _precompute_ctx_vecs(self):
@@ -169,8 +180,8 @@ class LogWithContextDatasetMemoryOptimized(Dataset):
         if os.path.exists(cache_path):
             try:
                 print(f"[Cache] Loading context vectors from {cache_path}")
-                ctx_vecs = torch.load(cache_path, map_location=self.device)
-                return ctx_vecs.to(self.device, dtype=torch.float32)
+                ctx_vecs = torch.load(cache_path, map_location=self.storage_device)
+                return ctx_vecs.to(self.storage_device, dtype=torch.float32)
             except Exception as e:
                 print(f"[Cache] Failed to load context cache: {e}. Recomputing...")
                 try:
@@ -185,22 +196,25 @@ class LogWithContextDatasetMemoryOptimized(Dataset):
         for tokens, log_vec in tqdm(zip(self.tokens_list, self.log_vecs),
                                     total=len(self.tokens_list),
                                     desc="Computing context"):
+            log_vec_device = log_vec.to(self.device)
             if hasattr(self.ctx_agent, "get_ctx_vec"):
                 try:
                     ctx_vec = self.ctx_agent.get_ctx_vec()
                 except TypeError:
-                    ctx_vec = self.ctx_agent.get_ctx_vec(log_vec)
+                    ctx_vec = self.ctx_agent.get_ctx_vec(log_vec_device)
             else:
-                ctx_vec = torch.zeros_like(log_vec)
+                ctx_vec = torch.zeros_like(log_vec_device)
 
-            ctx_vecs.append(ctx_vec.detach().clone().to(self.device, dtype=torch.float32))
+            ctx_vecs.append(
+                ctx_vec.detach().clone().to(self.storage_device, dtype=torch.float32)
+            )
 
             if hasattr(self.ctx_agent, "update_window"):
-                self.ctx_agent.update_window(tokens, log_vec)
+                self.ctx_agent.update_window(tokens, log_vec_device)
 
         ctx_vecs = torch.stack(ctx_vecs, dim=0)
 
         os.makedirs(CACHE_DIR, exist_ok=True)
-        torch.save(ctx_vecs.cpu(), cache_path)
+        torch.save(ctx_vecs.to(self.storage_device), cache_path)
 
-        return ctx_vecs.to(self.device, dtype=torch.float32)
+        return ctx_vecs
