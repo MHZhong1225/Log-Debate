@@ -36,8 +36,8 @@ MODEL_PATH  = f"model/{DATASET}/{DATASET}_best_mlp.pt"
 
 DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TRAIN_CSV = f"./datasets/{DATASET}/log_train_0p1.csv"  # 使用10%的数据集
-VAL_CSV   = f"./datasets/{DATASET}/log_val.csv"
-TEST_CSV  = f"./datasets/{DATASET}/log_test.csv"
+VAL_CSV   = f"./datasets/{DATASET}/log_val_0p1.csv"
+TEST_CSV  = f"./datasets/{DATASET}/log_test_0p1.csv"
 
 
 # ================== 1. 定义双塔模型 ==================
