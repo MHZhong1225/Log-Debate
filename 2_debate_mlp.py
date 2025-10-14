@@ -42,10 +42,10 @@ class TwoMLP(nn.Module):
         return logits
 
 # --- 配置 ---
-DATASET = "Tbird"  # BGL HDFS Tbird Hadoop 
+DATASET = "HDFS"  # BGL HDFS Tbird Hadoop 
 MLP1_MODEL_PATH = f"model/{DATASET}/{DATASET}_best_mlp.pt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CONFIDENCE_THRESHOLD = 0.85
+CONFIDENCE_THRESHOLD = 0.8
 CLASS_MAP = {0: "Normal", 1: "Anomaly"}
 # if DATASET == 'Hadoop':
 #     CLASS_MAP = {0: "Normal", 1: "Network Disconnection", 2: "Machine Down", 3: "Disk Full"}
@@ -96,6 +96,8 @@ def generate_features_for_split(split_name: str):
     input_csv = f"./datasets/{DATASET}/log_{split_name}.csv"
     if split_name == "train":
         input_csv = f"./datasets/{DATASET}/log_train_1p0.csv"
+    if DATASET == "Tbird":
+        input_csv = f"./datasets/{DATASET}/log_{split_name}_1p0.csv"
     output_csv = f"./datasets/{DATASET}/{split_name}_for_mlp2.csv"
     
     # 检查输出文件是否已存在
