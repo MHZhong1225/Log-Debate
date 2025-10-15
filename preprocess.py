@@ -225,6 +225,16 @@ def preprocess_hdfs():
                  for k,v in split_win.items()}
     save_splits(split_log, "log", OUT)
 
+
+    small_ratios = {"0p1": 0.001, "0p5": 0.005, "1p0": 0.01}
+    for tag, frac in small_ratios.items():
+        for split_name, df_part in split_log.items():
+            sub = stratified_head_fraction(df_part, frac, min_per_class=1)
+            out_fp = OUT / f"log_{split_name}_{tag}.csv"
+            sub.to_csv(out_fp, index=False)
+            dist = dict(sub.label.value_counts().sort_index())
+            print(f"[✓] {out_fp.name:20s}: {len(sub)} 行 {dist}")
+
 # ================ 3. BGL ================
 def preprocess_bgl():
     print("\n==== BGL ====")
@@ -252,6 +262,15 @@ def preprocess_bgl():
     split_log = {k: df_line[df_line.win_id.isin(set(v.win_id))].reset_index(drop=True)
                  for k,v in split_win.items()}
     save_splits(split_log, "log", OUT)
+
+    small_ratios = {"0p1": 0.001, "0p5": 0.005, "1p0": 0.01}
+    for tag, frac in small_ratios.items():
+        for split_name, df_part in split_log.items():
+            sub = stratified_head_fraction(df_part, frac, min_per_class=1)
+            out_fp = OUT / f"log_{split_name}_{tag}.csv"
+            sub.to_csv(out_fp, index=False)
+            dist = dict(sub.label.value_counts().sort_index())
+            print(f"[✓] {out_fp.name:20s}: {len(sub)} 行 {dist}")
 
 # ================ 4. Tbird ================
 def preprocess_tbird():

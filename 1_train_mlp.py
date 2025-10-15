@@ -1,226 +1,226 @@
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from sklearn.metrics import f1_score, accuracy_score, classification_report
-import gc  # 用于内存清理
+from sklearn.metrics import f1_score, accuracy_score, classification_report, roc_auc_score, average_precision_score
+import argparse
 from collections import Counter
 
-# 这个新版 Dataset 的 __getitem__ 会返回 ((log_vec, ctx_vec), label)
-from dataset_log_with_context_memory_optimized import LogWithContextDatasetMemoryOptimized as LogWithContextDataset
+# 确保以下两个文件与此脚本位于同一目录或正确的 Python 路径中
+from dataset_log_with_context_twotower import LogWithContextDataset
 from context_agent import ContextAgent
 
-import argparse
-
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--dataset",      default="Tbird") # BGL HDFS Tbird Hadoop
-    p.add_argument("--batch_size",   type=int,   default=32)
-    p.add_argument("--epochs",       type=int,   default=30)
-    p.add_argument("--lr",           type=float, default=5e-4)
+    p = argparse.ArgumentParser(description="Train Hybrid Coherence Model (Classification + Coherence Loss)")
+    p.add_argument("--dataset",      default="BGL", help="Dataset name: BGL, HDFS, Tbird, Hadoop")
+    p.add_argument("--batch_size",   type=int,   default=32, help="Batch size for training")
+    p.add_argument("--epochs",       type=int,   default=22, help="Number of training epochs")
+    p.add_argument("--lr",           type=float, default=5e-4, help="Learning rate")
+    
+    # Coherence Loss Hyperparameters
+    p.add_argument("--alpha",        type=float, default=1.0, help="Weight for alignment loss")
+    p.add_argument("--beta",         type=float, default=0.1, help="Weight for variance loss")
+    p.add_argument("--delta",        type=float, default=0.1, help="Weight for covariance loss")
+    p.add_argument("--eta",          type=float, default=0.5, help="Weight for score margin loss")
+    p.add_argument("--gamma",        type=float, default=1.0, help="Target stddev for variance loss")
+    p.add_argument("--margin",       type=float, default=0.8, help="Score margin for normal samples")
+
+    # 新增：混合损失的权重
+    p.add_argument("--lambda_coeff", "-l_c", type=float, default=0.5, help="Weight for the coherence loss component")
     return p.parse_args()
 
 args = parse_args()
 
-# --- 把下列常量改用 args ---
+# --- 全局常量 ---
 DATASET     = args.dataset
 BATCH_SIZE  = args.batch_size
 EPOCHS      = args.epochs
 LR          = args.lr
-MODEL_PATH  = f"model/{DATASET}/{DATASET}_best_mlp.pt"
+MODEL_PATH  = f"model/{DATASET}/{DATASET}_best_hybrid_model.pt" # 新的模型路径
+os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
 
 DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-TRAIN_CSV = f"./datasets/{DATASET}/log_train_1p0.csv"  # 使用10%的数据集
+TRAIN_CSV = f"./datasets/{DATASET}/log_train_1p0.csv"
 VAL_CSV   = f"./datasets/{DATASET}/log_val_1p0.csv"
-TEST_CSV  = f"./datasets/{DATASET}/log_test_1p0.csv"
+TEST_CSV  = f"./datasets/{DATASET}/log_test.csv"
+if DATASET=='Tbird':
+    # VAL_CSV   = f"./datasets/{DATASET}/log_val_1p0.csv"
+    TEST_CSV  = f"./datasets/{DATASET}/log_test_1p0.csv"
+NORMAL_LABEL = 0
+NUM_CLASSES = 2 # ✨ 新增
 
-
-# ================== 1. 定义模型 ==================
-class TwoMLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_classes):
+# ================== 1. 模型定义 (保持不变) ==================
+class CoherenceModel(nn.Module):
+    def __init__(self, input_dim, proj_dim, hidden_dim, num_classes=2):
         super().__init__()
-        # 假设 log_vec 和 ctx_vec 维度相同
-        tower_input_dim = input_dim
-
-        # Log Agent 的处理 (微观分析)
-        self.log_tower = nn.Sequential(
-            nn.Linear(tower_input_dim, hidden_dim),
+        self.log_projector = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2)
+            # nn.BatchNorm1d(hidden_dim),
+            nn.Linear(hidden_dim, proj_dim)
+        )
+        self.context_projector = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, proj_dim)
         )
         
-        # Context Agent 的处理 (宏观分析)
-        self.context_tower = nn.Sequential(
-            nn.Linear(tower_input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2)
-        )
+        fused_feature_dim = proj_dim * 4
         
-        # 融合后的分类头
-        # 输入维度是两个模型输出维度之和
-        fused_dim = (hidden_dim // 2) * 2
-        self.classifier_head = nn.Linear(fused_dim, num_classes)
+        self.scoring_head = nn.Sequential(
+            nn.Linear(fused_feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+        self.classifier_head = nn.Sequential(
+            nn.Linear(fused_feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_classes)
+        )
 
     def forward(self, log_vec, ctx_vec):
+        z_e = self.log_projector(log_vec)
+        z_c = self.context_projector(ctx_vec)
         
-        log_features = self.log_tower(log_vec)
-        ctx_features = self.context_tower(ctx_vec)
+        diff = torch.abs(z_e - z_c)
+        prod = z_e * z_c
+        fused_features = torch.cat([z_e, z_c, diff, prod], dim=-1)
         
-        # 拼接两个的输出特征
-        fused_features = torch.cat([log_features, ctx_features], dim=-1)
-        
-        # 通过分类头得到最终的 logits
+        score = self.scoring_head(fused_features).squeeze(-1)
         logits = self.classifier_head(fused_features)
         
-        return logits
+        return score, logits, z_e, z_c
 
-# ================== 工具函数 ==================
+# ================== 2. 损失函数定义 (保持不变) ==================
+def alignment_loss(z_e, z_c): return (1 - F.cosine_similarity(z_e, z_c)).mean()
+def variance_loss(z, gamma=1.0): return F.relu(gamma - torch.sqrt(z.var(dim=0) + 1e-4)).mean()
+def covariance_loss(z):
+    z = z - z.mean(dim=0)
+    cov = (z.T @ z) / (z.size(0) - 1)
+    off_diag_cov = cov.flatten()[:-1].view(z.size(1) - 1, z.size(1) + 1)[:, 1:].flatten()
+    return off_diag_cov.pow(2).mean()
+def score_margin_loss(score, labels, margin=0.8):
+    mask = (labels == NORMAL_LABEL).float()
+    loss = F.relu(margin - score) * mask
+    return loss.sum() / mask.sum() if mask.sum() > 0 else torch.tensor(0.0, device=score.device)
+
+# ================== 3. 评估函数 (保持不变) ==================
+def eval_model(model, loader, device):
+    model.eval()
+    all_logits, all_labels = [], []
+    with torch.no_grad():
+        for (log_vec, ctx_vec), labels in loader:
+            log_vec, ctx_vec = log_vec.to(device), ctx_vec.to(device)
+            _, logits, _, _ = model(log_vec, ctx_vec)
+            all_logits.append(logits.cpu())
+            all_labels.append(labels.cpu().numpy())
+            
+    all_logits = torch.cat(all_logits, dim=0)
+    all_labels = np.concatenate(all_labels).flatten()
+    
+    y_true_binary = (all_labels != NORMAL_LABEL).astype(int)
+    y_pred = torch.argmax(all_logits, dim=1).numpy()
+    anomaly_probs = F.softmax(all_logits, dim=1)[:, 1].numpy()
+
+    f1 = f1_score(y_true_binary, y_pred)
+    acc = accuracy_score(y_true_binary, y_pred)
+    auroc = roc_auc_score(y_true_binary, anomaly_probs)
+    auprc = average_precision_score(y_true_binary, anomaly_probs)
+    
+    return f1, acc, auroc, auprc, y_true_binary, y_pred
+
+# ================== 主逻辑 ==================
 def build_dataset(csv_path, split_name):
     df = pd.read_csv(csv_path)
-    logs   = df["content"].tolist()
-    labels = df["label"].tolist()
-    ctx_agent = ContextAgent(window_size=100, hist_agg="max")
-    
-    # 使用新的 Dataset 类
-    ds = LogWithContextDataset(
-        raw_logs=logs,
-        labels=labels,
-        mode=split_name,
-        ctx_agent=ctx_agent,
-        batch_encode_size=32
+    df['label'] = df['label'].astype(int)
+    return LogWithContextDataset(
+        raw_logs=df["content"].tolist(), labels=df["label"].tolist(),
+        mode=split_name, ctx_agent=ContextAgent(window_size=100),
+        batch_encode_size=64
     )
-    return ds, np.array(labels)
-
-
-def eval_multiclass(model, loader, device):
-    model.eval()
-    y_true, y_pred = [], []
-    with torch.no_grad():
-        # 修改点：解包数据
-        for (log_vec, ctx_vec), y in loader:
-            log_vec = log_vec.to(device, non_blocking=True)
-            ctx_vec = ctx_vec.to(device, non_blocking=True)
-
-            # 修改点：模型接收两个输入
-            logits = model(log_vec, ctx_vec)
-            pred = logits.argmax(dim=1).cpu()
-            y_pred.append(pred.numpy())
-            y_true.append(y.cpu().numpy())
-    
-    y_true = np.concatenate(y_true)
-    y_pred = np.concatenate(y_pred)
-    f1  = f1_score(y_true, y_pred, average="macro")
-    acc = accuracy_score(y_true, y_pred)
-    return f1, acc, y_true, y_pred
-
-# ================== 构建数据集/加载器 ==================
 
 if __name__ == "__main__":
-    print(f"[Memory] Building datasets...")
-    train_ds, y_train = build_dataset(TRAIN_CSV, "train")
+    print(f"Training on {DATASET} with device {DEVICE}")
 
+    train_ds, val_ds, test_ds = [build_dataset(p, m) for p, m in zip([TRAIN_CSV, VAL_CSV, TEST_CSV], ["train", "val", "inference"])]
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
-    gc.collect()  # 清理内存
-    print(f"[Memory] Train dataset built, memory cleaned")
+    #  --- 计算加权损失 ---
+    # print("Calculating weights for CrossEntropyLoss...")
+    # # 1. 获取训练集的所有二分类标签 (0 for normal, 1 for anomaly)
+    # y_train_binary = (train_ds.labels.squeeze() != NORMAL_LABEL).long()
+
+    # # 2. 统计每个类别的数量
+    # class_counts = Counter(y_train_binary.tolist())
+    # print(f"Training class counts: {class_counts}")
+
+    # # 3. 计算权重 (数量越少，权重越大)
+    # weights = torch.tensor(
+    #     [class_counts.get(i, 0) for i in range(NUM_CLASSES)],
+    #     dtype=torch.float
+    # )
+    # weights = 1.0 / torch.clamp(weights, min=1.0)  # Use min=1 to avoid division by zero
+    # weights = weights / weights.sum() * NUM_CLASSES    # 归一化到均值≈1
+    # weights = weights.to(DEVICE)
+    # print(f"Calculated weights: {weights.cpu().numpy()}")
+
+    model = CoherenceModel(input_dim=384, proj_dim=128, hidden_dim=256, num_classes=2).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     
-    val_ds,   y_val   = build_dataset(VAL_CSV,   "val")
-    gc.collect()  # 清理内存
-    print(f"[Memory] Val dataset built, memory cleaned")
-    
-    test_ds,  y_test  = build_dataset(TEST_CSV,  "inference")
-    gc.collect()  # 清理内存
-    print(f"[Memory] Test dataset built, memory cleaned")
+    # 使用计算出的权重初始化损失函数
+    # classification_criterion = nn.CrossEntropyLoss(weight=weights)
+    classification_criterion = nn.CrossEntropyLoss()
 
-    classes = sorted(set(np.concatenate([y_train, y_val, y_test]).tolist()))
-    NUM_CLASSES = int(max(classes) + 1)
-    print(f"[Info] num_classes={NUM_CLASSES}, classes={classes}")
-
-
-
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, # ✨ 训练时建议打乱
-                              num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=4, pin_memory=True)
-    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=4, pin_memory=True)
-
-    # ================== 构建模型 ==================
-    # all-MiniLM-L6-v2 的输出维度是 384
-    # ContextAgent 内部的 proj 层输出也是 hidden_dim，即 384
-    INPUT_DIM = 384 
-    print(f"[Info] Tower INPUT_DIM={INPUT_DIM}")
-
-    mlp = TwoMLP(
-        input_dim=INPUT_DIM,
-        hidden_dim=256,
-        num_classes=NUM_CLASSES
-    ).to(DEVICE)
-
-    class_counts = Counter(y_train.tolist())
-    weights = torch.tensor(
-        [class_counts.get(i, 0) for i in range(NUM_CLASSES)],
-        dtype=torch.float
-    )
-    weights = 1.0 / torch.clamp(weights, min=1.0)
-    weights = weights / weights.sum() * NUM_CLASSES    # 归一化到均值≈1
-    weights = weights.to(DEVICE)
-
-    print("[Info] class_counts:", class_counts)
-    print("[Info] loss weights :", weights.cpu().numpy())
-
-    criterion = nn.CrossEntropyLoss(weight=weights)    # ←⭐ 用加权损失
-
-    # criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(mlp.parameters(), lr=LR)
-    steps_per_epoch = len(train_loader)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=steps_per_epoch * EPOCHS   # 完整余弦退火
-    )
-
-    # ================== 训练循环 ==================
     best_f1 = 0.0
     for epoch in range(EPOCHS):
-        mlp.train()
-        total_loss, n_batches = 0.0, 0
+        model.train()
+        total_loss = 0
+        for (log_vec, ctx_vec), labels in train_loader:
+            log_vec, ctx_vec, labels = log_vec.to(DEVICE), ctx_vec.to(DEVICE), labels.squeeze().to(DEVICE)
+            
+            score, logits, z_e, z_c = model(log_vec, ctx_vec)
+            
+            l_align = alignment_loss(z_e, z_c)
+            l_var = variance_loss(z_e, args.gamma) + variance_loss(z_c, args.gamma)
+            l_cov = covariance_loss(z_e) + covariance_loss(z_c)
+            l_score = score_margin_loss(score, labels, args.margin)
+            loss_coherence = (args.alpha*l_align + args.beta*l_var + args.delta*l_cov + args.eta*l_score)
 
-        # 解包
-        for (log_vec, ctx_vec), y in train_loader:
-            log_vec = log_vec.to(DEVICE, non_blocking=True)
-            ctx_vec = ctx_vec.to(DEVICE, non_blocking=True)
-            # y = y.to(DEVICE).long().squeeze(-1)
-            y = y.to(DEVICE).long()
+            y_true_binary = (labels != NORMAL_LABEL).long()
+            loss_clf = classification_criterion(logits, y_true_binary)
 
-            logits = mlp(log_vec, ctx_vec)
-            loss = criterion(logits, y)
+            loss = loss_clf + args.lambda_coeff * loss_coherence
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            scheduler.step()
-
             total_loss += loss.item()
-            n_batches += 1
-
-        # 验证
-        val_f1, val_acc, _, _ = eval_multiclass(mlp, val_loader, DEVICE)
-        print(f"Epoch {epoch+1:03d} | Loss: {total_loss/max(1,n_batches):.4f} "
-              f"| ValF1(macro): {val_f1:.4f} Acc: {val_acc:.4f}")
+        
+        avg_loss = total_loss / len(train_loader)
+        
+        val_f1, val_acc, val_auroc, val_auprc, _, _ = eval_model(model, val_loader, DEVICE)
+        print(f"Epoch {epoch+1:02d}/{EPOCHS} | Loss: {avg_loss:.4f} | Val F1: {val_f1:.4f} | Val AUROC: {val_auroc:.4f} | Val AUPRC: {val_auprc:.4f}")
 
         if val_f1 > best_f1:
             best_f1 = val_f1
-            torch.save(mlp.state_dict(), MODEL_PATH)
-            print("[✓] Saved best model")
+            torch.save(model.state_dict(), MODEL_PATH)
+            print(f"[✓] Saved best model with F1: {best_f1:.4f}")
 
-    # ================== 测试 ==================
-    mlp.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    test_f1, test_acc, y_true, y_pred = eval_multiclass(mlp, test_loader, DEVICE)
+    print("\n--- Final Evaluation on Test Set ---")
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    test_f1, test_acc, test_auroc, test_auprc, y_true, y_pred = eval_model(model, test_loader, DEVICE)
+    
     print(f"\n[Final Results for {DATASET}]")
-    print(f"Test F1(macro): {test_f1:.6f}")
-    print(f"Test Acc:       {test_acc:.6f}")
-    print("Per-class report:\n", classification_report(y_true, y_pred, digits=4))
+    print(f"Test F1 (Anomaly):          {test_f1:.4f}\nTest Accuracy:    {test_acc:.4f}")
+    print(f"Test AUROC:       {test_auroc:.4f}\nTest AUPRC:       {test_auprc:.4f}")
+    print("\nClassification Report:")
+    print(classification_report(y_true, y_pred, target_names=['Normal', 'Anomaly'], digits=4))

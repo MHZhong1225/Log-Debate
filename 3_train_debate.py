@@ -1,7 +1,7 @@
 # train_debate.py
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -98,7 +98,7 @@ class ThreeTowerMLP(nn.Module):
 # --- 3. 训练和评估主逻辑 ---
 def main():
     # --- 配置 ---
-    DATASET = "BGL" # BGL HDFS Tbird Hadoop
+    DATASET = "Tbird" # BGL HDFS Tbird Hadoop
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     BATCH_SIZE = 32
     EPOCHS = 50
