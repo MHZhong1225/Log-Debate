@@ -20,7 +20,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train Hybrid Coherence Model (Classification + Coherence Loss)")
     p.add_argument("--dataset",      default="BGL", help="Dataset name: BGL, HDFS, Tbird, Hadoop")
     p.add_argument("--batch_size",   type=int,   default=32, help="Batch size for training")
-    p.add_argument("--epochs",       type=int,   default=22, help="Number of training epochs")
+    p.add_argument("--epochs",       type=int,   default=19, help="Number of training epochs")
     p.add_argument("--lr",           type=float, default=5e-4, help="Learning rate")
     
     # Coherence Loss Hyperparameters
@@ -32,7 +32,7 @@ def parse_args():
     p.add_argument("--margin",       type=float, default=0.8, help="Score margin for normal samples")
 
     # 新增：混合损失的权重
-    p.add_argument("--lambda_coeff", "-l_c", type=float, default=0.5, help="Weight for the coherence loss component")
+    p.add_argument("--lambda_coeff", "-l_c", type=float, default=1, help="Weight for the coherence loss component")
     return p.parse_args()
 
 args = parse_args()
@@ -53,7 +53,7 @@ if DATASET=='Tbird':
     # VAL_CSV   = f"./datasets/{DATASET}/log_val_1p0.csv"
     TEST_CSV  = f"./datasets/{DATASET}/log_test_1p0.csv"
 NORMAL_LABEL = 0
-NUM_CLASSES = 2 # ✨ 新增
+NUM_CLASSES = 2
 
 # ================== 1. 模型定义 (保持不变) ==================
 class CoherenceModel(nn.Module):
@@ -150,7 +150,7 @@ if __name__ == "__main__":
     print(f"Training on {DATASET} with device {DEVICE}")
 
     train_ds, val_ds, test_ds = [build_dataset(p, m) for p, m in zip([TRAIN_CSV, VAL_CSV, TEST_CSV], ["train", "val", "inference"])]
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
@@ -191,9 +191,10 @@ if __name__ == "__main__":
             
             l_align = alignment_loss(z_e, z_c)
             l_var = variance_loss(z_e, args.gamma) + variance_loss(z_c, args.gamma)
-            l_cov = covariance_loss(z_e) + covariance_loss(z_c)
+            # l_cov = covariance_loss(z_e) + covariance_loss(z_c)
             l_score = score_margin_loss(score, labels, args.margin)
-            loss_coherence = (args.alpha*l_align + args.beta*l_var + args.delta*l_cov + args.eta*l_score)
+            # loss_coherence = (args.alpha*l_align + args.beta*l_var + args.delta*l_cov + args.eta*l_score)
+            loss_coherence = (args.alpha*l_align + args.beta*l_var + args.eta*l_score)
 
             y_true_binary = (labels != NORMAL_LABEL).long()
             loss_clf = classification_criterion(logits, y_true_binary)
