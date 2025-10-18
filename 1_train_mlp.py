@@ -1,4 +1,6 @@
 import os
+
+from model import CoherenceModel
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
@@ -10,17 +12,16 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, accuracy_score, classification_report, roc_auc_score, average_precision_score
 import argparse
-from collections import Counter
 
 # 确保以下两个文件与此脚本位于同一目录或正确的 Python 路径中
-from dataset_log_with_context_twotower import LogWithContextDataset
+from dataset_log_with_context import LogWithContextDataset
 from context_agent import ContextAgent
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train Hybrid Coherence Model (Classification + Coherence Loss)")
     p.add_argument("--dataset",      default="BGL", help="Dataset name: BGL, HDFS, Tbird, Hadoop")
     p.add_argument("--batch_size",   type=int,   default=32, help="Batch size for training")
-    p.add_argument("--epochs",       type=int,   default=19, help="Number of training epochs")
+    p.add_argument("--epochs",       type=int,   default=20, help="Number of training epochs")
     p.add_argument("--lr",           type=float, default=5e-4, help="Learning rate")
     
     # Coherence Loss Hyperparameters
@@ -42,7 +43,7 @@ DATASET     = args.dataset
 BATCH_SIZE  = args.batch_size
 EPOCHS      = args.epochs
 LR          = args.lr
-MODEL_PATH  = f"model/{DATASET}/{DATASET}_best_hybrid_model.pt" # 新的模型路径
+MODEL_PATH  = f"model/{DATASET}/{DATASET}_model.pt" # 新的模型路径
 os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
 
 DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -50,53 +51,11 @@ TRAIN_CSV = f"./datasets/{DATASET}/log_train_1p0.csv"
 VAL_CSV   = f"./datasets/{DATASET}/log_val_1p0.csv"
 TEST_CSV  = f"./datasets/{DATASET}/log_test.csv"
 if DATASET=='Tbird':
-    # VAL_CSV   = f"./datasets/{DATASET}/log_val_1p0.csv"
+    VAL_CSV   = f"./datasets/{DATASET}/log_val_1p0.csv"
     TEST_CSV  = f"./datasets/{DATASET}/log_test_1p0.csv"
 NORMAL_LABEL = 0
 NUM_CLASSES = 2
 
-# ================== 1. 模型定义 (保持不变) ==================
-class CoherenceModel(nn.Module):
-    def __init__(self, input_dim, proj_dim, hidden_dim, num_classes=2):
-        super().__init__()
-        self.log_projector = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            # nn.BatchNorm1d(hidden_dim),
-            nn.Linear(hidden_dim, proj_dim)
-        )
-        self.context_projector = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, proj_dim)
-        )
-        
-        fused_feature_dim = proj_dim * 4
-        
-        self.scoring_head = nn.Sequential(
-            nn.Linear(fused_feature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
-        self.classifier_head = nn.Sequential(
-            nn.Linear(fused_feature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_classes)
-        )
-
-    def forward(self, log_vec, ctx_vec):
-        z_e = self.log_projector(log_vec)
-        z_c = self.context_projector(ctx_vec)
-        
-        diff = torch.abs(z_e - z_c)
-        prod = z_e * z_c
-        fused_features = torch.cat([z_e, z_c, diff, prod], dim=-1)
-        
-        score = self.scoring_head(fused_features).squeeze(-1)
-        logits = self.classifier_head(fused_features)
-        
-        return score, logits, z_e, z_c
 
 # ================== 2. 损失函数定义 (保持不变) ==================
 def alignment_loss(z_e, z_c): return (1 - F.cosine_similarity(z_e, z_c)).mean()
