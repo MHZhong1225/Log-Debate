@@ -226,7 +226,7 @@ def preprocess_hdfs():
     save_splits(split_log, "log", OUT)
 
 
-    small_ratios = {"0p1": 0.001, "0p5": 0.005, "1p0": 0.01}
+    small_ratios = {"0p1": 0.00125, "0p5": 0.00625, "1p0": 0.0125}
     for tag, frac in small_ratios.items():
         for split_name, df_part in split_log.items():
             sub = stratified_head_fraction(df_part, frac, min_per_class=1)
@@ -250,7 +250,7 @@ def preprocess_bgl():
             labels.append(0 if first=="-" else 1); texts.append(rest)
     df_line = pd.DataFrame(dict(label=labels, content=texts))
     print("总行数 / label 分布:", len(df_line), dict(df_line.label.value_counts().sort_index()))
-    df_line = df_line.dropna(subset=['content'])   # ← NEW
+    df_line = df_line.dropna(subset=['content'])
     # 滑动窗口
     n=len(df_line); win_id=np.full(n,-1,int); w=0
     for s in range(0,n,step): win_id[s:min(s+win,n)]=w; w+=1

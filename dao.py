@@ -26,13 +26,11 @@ def parse_args():
     p.add_argument("--batch_size",   type=int,   default=256, help="Batch size for evaluation")
     p.add_argument("--context_window", type=int, default=5, help="Number of preceding logs for LLM context")
     
-    # RCDL 关键参数
-    p.add_argument("--lambda_coeff", "-l", type=float, default=0.5, help="Weight for LLM risk score r_t (lambda)")
+    p.add_argument("--lambda_coeff", "-l", type=float, default=0.3, help="Weight for LLM risk score r_t (lambda)")
     p.add_argument("--decision_threshold", "-d", type=float, default=0.5, help="Final decision threshold (delta)")
     
-    # 触发 LLM 的不确定性区间
     # 默认值 [0.1, 0.9] 意味着对非常自信的样本 (s_t < 0.1 或 s_t > 0.9) 跳过 LLM
-    p.add_argument("--uncertainty_lower", type=float, default=0.08, help="Lower bound of uncertainty (trigger LLM if s_t > this)")
+    p.add_argument("--uncertainty_lower", type=float, default=0.1, help="Lower bound of uncertainty (trigger LLM if s_t > this)")
     p.add_argument("--uncertainty_upper", type=float, default=0.9, help="Upper bound of uncertainty (trigger LLM if s_t < this)")
     
     return p.parse_args()
@@ -48,7 +46,7 @@ def call_llm_for_debate_RCDL(target_log: str, context_logs: list[str], tokenizer
     # Risk Score (0.0 to 1.0):
     # (Provide *only* a single numeric value representing your final risk assessment.)
     # (Provide 1-2 concise bullet points arguing why the Target Log could be anomalous.)
-
+    # decide which explanation is more convincing, 
     prompt = f"""
 As an expert Site Reliability Engineer, your task is to conduct a structured, evidence-based debate on whether the "Target Log" is anomalous, based on the "Context".
 (A score near 0.0 is Normal, a score near 1.0 is Anomalous)
@@ -68,7 +66,7 @@ Evidence for Normality:
 (Provide 1 concise bullet points that BEST argues why the Target Log could be normal.)
 
 Final Verdict:
-Use your reasoning to reach a definite conclusion, decide which explanation is more convincing, provide the final verdict. (You MUST classify the "Target Log" as either ANOMALY or NORMAL. Respond with *ONLY* the single word "ANOMALY" or "NORMAL".)
+Use your reasoning to reach a definite conclusion, provide the final verdict. (Respond with *ONLY* the single word "ANOMALY" or "NORMAL".)
 """
     messages = [{"role": "system", "content": "You are an expert system engineer responsible for log anomaly analysis."}, {"role": "user", "content": prompt}]
     chat_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
