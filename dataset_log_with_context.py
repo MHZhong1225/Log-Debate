@@ -22,13 +22,10 @@ class LogWithContextDataset(Dataset):
         if not hasattr(self.ctx_agent, "encoder"):
             raise RuntimeError("ContextAgent needs to have an 'encoder' attribute.")
 
-        # 预计算log vectors和tokens
         self.tokens_list, self.log_vecs = self._batch_encode_logs(self.logs, batch_encode_size)
         
-        # 预计算context vectors
         self.ctx_vecs = self._precompute_ctx_vecs()
 
-        # 处理标签
         if self.labels is not None:
             self.labels = torch.as_tensor(self.labels, dtype=torch.long)
 
@@ -47,7 +44,6 @@ class LogWithContextDataset(Dataset):
             return x, self.labels[idx]
 
     def _reset_ctx_agent_window(self):
-        """清空 ContextAgent 的窗口缓存。"""
         if hasattr(self.ctx_agent, "reset_window"):
             self.ctx_agent.reset_window()
 
@@ -78,8 +74,8 @@ class LogWithContextDataset(Dataset):
         torch.save({"tokens_list": tokens_list, "log_vecs": log_vecs.cpu()}, cache_path)
         return tokens_list, log_vecs
 
-    @torch.no_grad()
-    def _precompute_ctx_vecs(self):
+    # @torch.no_grad()
+    # def _precompute_ctx_vecs(self):
         if not self.use_context:
             return None
 
@@ -111,3 +107,35 @@ class LogWithContextDataset(Dataset):
         print(f"Saved context vectors to cache: {cache_path}")
         return ctx_vecs
         
+    @torch.no_grad()
+    def _precompute_ctx_vecs(self):
+        if not self.use_context:
+            return None
+
+        win_size = getattr(self.ctx_agent, "window_size", "na")
+        hist_agg = getattr(self.ctx_agent, "hist_agg", "na")
+        cfg_str = f"ctx-{len(self.logs)}-{self.mode}-{win_size}-{hist_agg}"
+        cache_name = hashlib.md5(cfg_str.encode()).hexdigest()[:16] + "_ctx.pt"
+        cache_path = os.path.join(CACHE_DIR, cache_name)
+        if os.path.exists(cache_path):
+            print(f"[Cache] Loading context vectors from {cache_path}")
+            return torch.load(cache_path, map_location=self.device)
+
+        self._reset_ctx_agent_window()
+        ctx_vecs_list = []
+        print(f"[Context] Computing context vectors for {len(self.tokens_list)} logs...")
+        
+        for i, log_vec in enumerate(tqdm(self.log_vecs, desc="Computing context")):
+            tokens = self.tokens_list[i]
+            
+            ctx_vec = self.ctx_agent.get_ctx_vec()
+            ctx_vecs_list.append(ctx_vec)
+            
+            self.ctx_agent.update_window(tokens, log_vec)
+
+        ctx_vecs = torch.stack(ctx_vecs_list, dim=0)
+        
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        torch.save(ctx_vecs.cpu(), cache_path)
+        print(f"Saved context vectors to cache: {cache_path}")
+        return ctx_vecs
